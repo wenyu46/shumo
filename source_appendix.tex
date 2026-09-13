@@ -1,0 +1,1764 @@
+\subsection{模型建立与温湿耦合求解内核（\texttt{model.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+# ==================== 依赖与路径配置 ====================
+from dataclasses import dataclass, asdict
+from functools import lru_cache
+from pathlib import Path
+import time
+import numpy as np
+import openpyxl
+from scipy.linalg import solve_banded
+
+# 当前脚本所在目录：用于定位题目附件数据
+ROOT = Path(__file__).resolve().parent
+
+
+# ==================== 数值积分与材料物性模型 ====================
+# 缓存高斯-勒让德积分节点与权重，供后续界面扩散系数积分使用
+@lru_cache(maxsize=None)
+def gauss(order):
+    z, w = np.polynomial.legendre.leggauss(order)
+    return (z + 1.0) / 2.0, w / 2.0
+
+
+# 根据材料类型、含水率与温度计算体积热容、导热系数和水分扩散系数
+def properties(material, c, t):
+    c = np.asarray(c, dtype=float)
+    t = np.asarray(t, dtype=float)
+    if material == 1:
+        return (np.full_like(c, 820.0 * 2600.0), np.full_like(c, 0.36),
+                7e-9 * np.exp(-0.89 / c))
+    if material == 3:
+        return ((650.0 + 128.0 * c) * (1450.0 + 2736.0 * c / (c + 1.0)),
+                0.21 + 0.38 * c / (c + 1.0),
+                2.4e-3 * np.exp(-0.45 / c - 3850.0 / (t + 273.15)))
+    if material == 4:
+        return ((760.0 + 90.0 * c) * (1850.0 + 2150.0 * c / (c + 1.0)),
+                0.12 + 0.20 * c / (c + 1.0),
+                4.2e-4 * np.exp(-0.30 / c - 3850.0 / (t + 273.15)))
+    raise ValueError(material)
+
+
+# 对相邻控制体含水率区间上的扩散系数进行高斯积分，得到界面有效扩散系数
+def integral_diffusivity(material, left, right, tface, order=8):
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    tface = np.asarray(tface, dtype=float)
+    z, w = gauss(order)
+    c = left[:, None] + (right - left)[:, None] * z
+    if material == 1:
+        vals = 7e-9 * np.exp(-0.89 / c)
+    elif material == 3:
+        vals = 2.4e-3 * np.exp(-0.45 / c - 3850.0 / (tface[:, None] + 273.15))
+    elif material == 4:
+        vals = 4.2e-4 * np.exp(-0.30 / c - 3850.0 / (tface[:, None] + 273.15))
+    else:
+        raise ValueError(material)
+    return vals @ w
+
+
+
+# ==================== 模型与数值求解参数 ====================
+@dataclass
+class Config:
+    # 物理模型与空间网格参数
+    material: int = 3
+    shrink: bool = False
+    n: int = 80
+    grid_power: float = 2.0
+    # 时间离散与数值积分参数
+    early_dt: float = 1.0
+    late_dt: float = 15.0
+    quadrature: int = 8
+    method: str = 'bdf2'
+    # 非线性迭代、方程残差与自适应步长控制参数
+    tolerance: float = 1e-9
+    residual_tolerance: float = 2e-8
+    step_tolerance: float = 1e-4
+    max_iterations: int = 40
+    endpoint_tolerance: float = 0.02
+    min_dt: float = 0.01
+    max_retries: int = 8
+    # 仿真终止条件与结果输出参数
+    max_time: float = 7 * 86400.0
+    stop_dry: bool = True
+    keep_short: bool = False
+    compact_output: bool = False
+    output_stride: int = 60
+    environment: str = 'last'
+
+
+
+# ==================== 输入数据与边界条件 ====================
+class Inputs:
+    def __init__(self):
+        # 读取空气温湿度与半径变化附件，并检查时间序列有效性
+        data = []
+        for name in ('附件1.xlsx', '附件2.xlsx'):
+            path = ROOT.parent / '附件' / name
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            rows = list(wb.active.values)
+            wb.close()
+            a = np.asarray(rows[1:], dtype=float)
+            if not np.isfinite(a).all() or not np.all(np.diff(a[:, 0]) > 0):
+                raise ValueError(f'invalid input: {name}')
+            data.append(a)
+        self.air, self.radii = data
+
+    def boundary(self, t, environment='last'):
+        # 根据当前时刻插值得到环境温度与环境含水边界值
+        a = self.air
+        # 超出附件时域时，可采用最后一小时均值作为延拓边界
+        if t > a[-1, 0] and environment == 'last_hour_mean':
+            block = a[a[:, 0] >= a[-1, 0] - 3600.0, 1:]
+            target = block.mean(axis=0)
+            if t <= a[-1, 0] + 60.0:
+                w = (t - a[-1, 0]) / 60.0
+                return tuple((1.0 - w) * a[-1, 1:] + w * target)
+            return tuple(target)
+        return (float(np.interp(t, a[:, 0], a[:, 1])),
+                float(np.interp(t, a[:, 0], a[:, 2])))
+
+    def radius(self, t, shrink):
+        # 未考虑收缩时保持初始半径不变
+        if not shrink:
+            return 0.02
+        # 考虑收缩时仅在附件给定时域内插值，禁止外推
+        if t > self.radii[-1, 0] + 1e-8:
+            raise ValueError('Shrinkage data extrapolation is not allowed')
+        return 0.01 * float(np.interp(t, self.radii[:, 0], self.radii[:, 1]))
+
+
+
+# 数值推进失败的统一异常类型，用于触发方法回退与步长缩减
+class StepFailure(RuntimeError):
+    pass
+
+
+
+# ==================== 热湿耦合有限体积求解器 ====================
+class Solver:
+    def __init__(self, config, inputs=None):
+        # 检查网格与输出参数是否合法
+        cfg = config
+        if cfg.n < 2 or cfg.grid_power < 1:
+            raise ValueError('invalid grid')
+        if cfg.keep_short and cfg.output_stride < 1:
+            raise ValueError('output_stride must be positive')
+        # 保存求解配置并加载边界输入
+        self.cfg = cfg
+        self.inputs = inputs or Inputs()
+        # 构造径向非均匀网格、控制体边界及归一化控制体体积
+        self.x = 1.0 - (1.0 - np.arange(cfg.n + 1, dtype=float) / cfg.n) ** cfg.grid_power
+        self.face = (self.x[:-1] + self.x[1:]) / 2.0
+        self.edges = np.r_[0.0, self.face, 1.0]
+        self.volume = np.diff(self.edges ** 2) / 2.0
+        self.dx = np.diff(self.x)
+        # 预设结果采样距离，并初始化数值稳定性与收敛统计量
+        self.output_distances_cm = np.arange(0.0, 2.001, 0.1)
+        self.stats = {
+            'steps': 0, 'iterations': 0, 'rejected_steps': 0,
+            'max_iterations': 0, 'max_mass_balance_residual': 0.0,
+            'max_moisture_equation_residual': 0.0,
+            'max_heat_equation_residual': 0.0,
+            'bdf2_steps': 0, 'euler_steps': 0, 'event_fallbacks': 0,
+            'step_failures': 0, 'max_step_error': 0.0,
+        }
+
+    # 组装有限体积隐式离散的三对角带状矩阵及表面对流边界项
+    def coefficients(self, face_coefficient, capacity, boundary, radius, dt):
+        face_coefficient = np.asarray(face_coefficient, dtype=float)
+        capacity = np.asarray(capacity, dtype=float)
+        g = self.face * face_coefficient / (self.dx * radius ** 2)
+        left = dt * np.r_[0.0, g] / (self.volume * capacity)
+        right = dt * np.r_[g, 0.0] / (self.volume * capacity)
+        conv = dt * boundary / (radius * self.volume[-1] * capacity[-1])
+        ab = np.zeros((3, len(capacity)), dtype=float)
+        ab[0, 1:] = -right[:-1]
+        ab[1, :] = 1.0 + left + right
+        ab[1, -1] += conv
+        ab[2, :-1] = -left[1:]
+        return ab, conv
+
+    # 求解一次固定系数的隐式线性扩散/传热方程
+    def linear_step(self, u, face_coefficient, capacity, boundary, ambient, radius, dt):
+        ab, conv = self.coefficients(face_coefficient, capacity, boundary, radius, dt)
+        rhs = np.asarray(u, dtype=float).copy()
+        rhs[-1] += conv * ambient
+        return solve_banded((1, 1), ab, rhs, check_finite=False)
+
+    # 根据相邻时间步长比构造变步长 BDF2 系数；条件不满足时退化为隐式 Euler
+    def _bdf_coefficients(self, dt, previous_dt, has_history, method=None):
+        method = method or self.cfg.method
+        if method != 'bdf2' or not has_history or previous_dt is None:
+            return 1.0 / dt, -1.0 / dt, 0.0, 'euler'
+        ratio = dt / previous_dt
+        if ratio < 0.5 - 1e-12 or ratio > 2.0 + 1e-12:
+            return 1.0 / dt, -1.0 / dt, 0.0, 'euler'
+        return ((1.0 + 2.0 * ratio) / (dt * (1.0 + ratio)),
+                -(1.0 + ratio) ** 2 / (dt * (1.0 + ratio)),
+                ratio ** 2 / (dt * (1.0 + ratio)), 'bdf2')
+
+    # 按一般 BDF 时间离散形式组装并求解三对角线性系统
+    def _linear_general(self, old, previous, face_coefficient, capacity,
+                        boundary, ambient, radius, dt, a0, a1, a2):
+        capacity = np.asarray(capacity, dtype=float)
+        g = self.face * np.asarray(face_coefficient, dtype=float) / (self.dx * radius ** 2)
+        scale = 1.0 / a0
+        left = scale * np.r_[0.0, g] / (self.volume * capacity)
+        right = scale * np.r_[g, 0.0] / (self.volume * capacity)
+        conv = scale * boundary / (radius * self.volume[-1] * capacity[-1])
+        ab = np.zeros((3, len(capacity)), dtype=float)
+        ab[0, 1:] = -right[:-1]
+        ab[1, :] = 1.0 + left + right
+        ab[1, -1] += conv
+        ab[2, :-1] = -left[1:]
+        history_rhs = -(a1 * old + a2 * previous) / a0
+        history_rhs = np.asarray(history_rhs, dtype=float)
+        history_rhs[-1] += conv * ambient
+        return solve_banded((1, 1), ab, history_rhs, check_finite=False)
+
+    # 计算离散守恒方程残差，用于判定非线性迭代是否真正收敛
+    def _residual(self, old, previous, new, face_coefficient, capacity,
+                  boundary, ambient, radius, dt, a0, a1, a2):
+        capacity = np.asarray(capacity, dtype=float)
+        g = self.face * np.asarray(face_coefficient, dtype=float) / (self.dx * radius ** 2)
+        flux_left = np.r_[0.0, g] * (new - np.r_[new[0], new[:-1]])
+        flux_right = np.r_[g, 0.0] * (np.r_[new[1:], new[-1]] - new)
+        flux_right[-1] = -boundary * (new[-1] - ambient) / radius
+        # 离散守恒方程：容量项 -（右侧通量 - 左侧通量）= 0
+        lhs = capacity * self.volume * (a0 * new + a1 * old + a2 * previous)
+        return lhs - (flux_right - flux_left)
+
+    # 计算控制体界面水分扩散系数：可选算术平均或积分平均
+    def diffusion_faces(self, c, temp):
+        if self.cfg.method == 'arithmetic':
+            d = properties(self.cfg.material, c, temp)[2]
+            return (d[:-1] + d[1:]) / 2.0
+        return integral_diffusivity(
+            self.cfg.material, c[:-1], c[1:],
+            (temp[:-1] + temp[1:]) / 2.0, self.cfg.quadrature)
+
+
+    # 执行一个候选时间步：耦合求解温度场与含水率场，并检查收敛与物理约束
+    def _attempt(self, t, old_t, old_c, prev_t, prev_c, previous_dt, dt, force_method=None):
+        cfg = self.cfg
+        # 获取新时刻的环境边界条件与当前半径
+        ta, ca = self.inputs.boundary(t + dt, cfg.environment)
+        radius = self.inputs.radius(t + dt, cfg.shrink)
+        # 根据历史状态决定采用 BDF2 还是隐式 Euler
+        has_history = prev_t is not None and prev_c is not None and previous_dt is not None
+        a0, a1, a2, actual_method = self._bdf_coefficients(
+            dt, previous_dt, has_history, force_method)
+        # 历史状态不足时使用当前旧状态补齐，保证统一离散格式
+        previous_t = old_t if prev_t is None else prev_t
+        previous_c = old_c if prev_c is None else prev_c
+        # 以旧状态作为 Picard 非线性迭代初值
+        new_t = old_t.copy()
+        new_c = old_c.copy()
+        previous_error = np.inf
+        damping = 1.0
+        last = None
+        # Picard 迭代：交替更新热传导方程与水分扩散方程
+        for it in range(1, cfg.max_iterations + 1):
+            # 根据当前温湿状态更新材料物性，并先求解温度场
+            cap, k, _ = properties(cfg.material, new_c, new_t)
+            ts = self._linear_general(
+                old_t, previous_t, (k[:-1] + k[1:]) / 2.0, cap,
+                25.0, ta, radius, dt, a0, a1, a2)
+            # 基于更新后的温度场计算扩散系数，再求解含水率场
+            dface = self.diffusion_faces(new_c, ts)
+            cs = self._linear_general(
+                old_c, previous_c, dface, np.ones_like(new_c),
+                8e-7, ca, radius, dt, a0, a1, a2)
+            # 非有限数值表明当前时间步失效
+            if not np.isfinite(ts).all() or not np.isfinite(cs).all():
+                raise StepFailure('nonfinite state')
+            # 以温度尺度归一化后的最大改变量作为 Picard 收敛指标
+            error = max(float(np.max(np.abs(ts - new_t))) / 50.0,
+                        float(np.max(np.abs(cs - new_c))))
+            last = (ts, cs)
+            # 达到迭代容差后进一步检查离散方程残差与物理可行性
+            if error <= cfg.tolerance:
+                cap2, k2, _ = properties(cfg.material, cs, ts)
+                dface2 = self.diffusion_faces(cs, ts)
+                rc = self._residual(
+                    old_c, previous_c, cs, dface2, np.ones_like(cs),
+                    8e-7, ca, radius, dt, a0, a1, a2)
+                rt = self._residual(
+                    old_t, previous_t, ts, (k2[:-1] + k2[1:]) / 2.0,
+                    cap2, 25.0, ta, radius, dt, a0, a1, a2)
+                rn_c = float(np.max(np.abs(rc)))
+                rn_t = float(np.max(np.abs(rt))) / 50.0
+                if max(rn_c, rn_t) <= cfg.residual_tolerance:
+                    # 含水率必须保持为正，并满足径向单调性约束
+                    if cs.min() <= 0.0:
+                        raise StepFailure('nonpositive state')
+                    monotonic_limit = 1e-10 * max(1.0, float(cs.max()))
+                    if float(np.diff(cs).max()) > monotonic_limit:
+                        raise StepFailure('radial monotonicity violation')
+                    # 记录收敛迭代次数、方程残差与质量守恒残差
+                    self.stats['iterations'] += it
+                    self.stats['max_iterations'] = max(self.stats['max_iterations'], it)
+                    self.stats['max_moisture_equation_residual'] = max(
+                        self.stats['max_moisture_equation_residual'], rn_c)
+                    self.stats['max_heat_equation_residual'] = max(
+                        self.stats['max_heat_equation_residual'], rn_t * 50.0)
+                    balance = abs(float(self.volume @ (
+                        a0 * cs + a1 * old_c + a2 * previous_c)
+                        + 8e-7 / radius * (cs[-1] - ca)))
+                    self.stats['max_mass_balance_residual'] = max(
+                        self.stats['max_mass_balance_residual'], balance)
+                    return ts, cs, actual_method, error
+            # 若误差出现增长，则减小松弛因子以增强非线性迭代稳定性
+            if error > previous_error * 1.05:
+                damping = 0.5
+            new_t += damping * (ts - new_t)
+            new_c += damping * (cs - new_c)
+            previous_error = error
+        raise StepFailure(f'{actual_method} iteration did not converge')
+
+    # 单步推进失败时优先回退到隐式 Euler，再将失败交给外层自适应步长处理
+    def _advance_once(self, *args, **kwargs):
+        try:
+            return self._attempt(*args, **kwargs)
+        except StepFailure:
+            force = kwargs.get('force_method')
+            if force != 'euler':
+                try:
+                    self.stats['event_fallbacks'] += 1 if force == 'bdf2' else 0
+                    return self._attempt(*args, **{**kwargs, 'force_method': 'euler'})
+                except StepFailure:
+                    pass
+            raise
+
+
+    # 采用“整步—两个半步”比较估计时间离散误差，并据此自适应调整步长
+    def _step_with_error(self, t, old_t, old_c, prev_t, prev_c, previous_dt, dt):
+        cfg = self.cfg
+        # 对当前时间步进行有限次数重试
+        for retry in range(cfg.max_retries + 1):
+            try:
+                # 先完成一个整步推进
+                full_t, full_c, method, picard_error = self._advance_once(
+                    t, old_t, old_c, prev_t, prev_c, previous_dt, dt)
+                # 无 BDF2 历史时不进行二阶步长误差估计
+                if cfg.method != 'bdf2' or prev_t is None or previous_dt is None:
+                    return full_t, full_c, dt, method, 0.0, retry
+                # 再执行两个半步，用于与整步结果比较
+                half = dt / 2.0
+                mid_t, mid_c, _, _ = self._advance_once(
+                    t, old_t, old_c, prev_t, prev_c, previous_dt, half)
+                end_t, end_c, _, _ = self._advance_once(
+                    t + half, mid_t, mid_c, old_t, old_c, half, half)
+                # 检查端点判据的单调性，避免错误跨越干燥终点
+                limit = 1e-10 * max(1.0, float(old_c.max()))
+                if (float(mid_c.max()) > float(old_c.max()) + limit
+                        or float(end_c.max()) > float(mid_c.max()) + limit):
+                    raise StepFailure('endpoint indicator is not monotone')
+                # 以整步与双半步之差估计当前时间步误差
+                err = max(float(np.max(np.abs(full_t - end_t))) / 50.0,
+                          float(np.max(np.abs(full_c - end_c))))
+                self.stats['max_step_error'] = max(self.stats['max_step_error'], err)
+                # 误差满足要求则接受整步结果
+                if err <= cfg.step_tolerance:
+                    return full_t, full_c, dt, method, err, retry
+                # 已达到最小步长仍不满足误差要求时判定步进失败
+                if dt <= cfg.min_dt * 1.0000001:
+                    self.stats['step_failures'] += 1
+                    raise StepFailure('step error remains above tolerance at min_dt')
+                # 根据误差大小缩短时间步并重新计算
+                dt = max(cfg.min_dt, min(dt / 2.0, dt * 0.9 *
+                         np.sqrt(cfg.step_tolerance / max(err, 1e-300))))
+                self.stats['rejected_steps'] += 1
+            # 数值求解失败时直接折半时间步后重试
+            except StepFailure:
+                if retry >= cfg.max_retries or dt <= cfg.min_dt * 1.0000001:
+                    self.stats['step_failures'] += 1
+                    raise
+                dt = max(cfg.min_dt, dt / 2.0)
+                self.stats['rejected_steps'] += 1
+        raise StepFailure('unreachable retry state')
+
+
+    # 构造紧凑输出快照：仅保存指定径向位置的温度和含水率采样值
+    def _compact_snapshot(self, t, temp, c):
+        radius_cm = self.inputs.radius(t, self.cfg.shrink) * 100.0
+        grid_cm = self.x * radius_cm
+        out = {'t': float(t), 'radius_cm': float(radius_cm),
+               'max_C': float(c.max()), 'wet_fraction': float(self._wet(c)),
+               'mean_C': float(2.0 * self.volume @ c),
+               'sample_distances_cm': self.output_distances_cm.tolist()}
+        for field, values in (('T', temp), ('C', c)):
+            out[field] = [float(np.interp(d, grid_cm, values))
+                          if d <= radius_cm + 1e-10 else None
+                          for d in self.output_distances_cm]
+        return out
+
+    # 根据 C >= 0.15 的径向区间计算仍处于湿润状态的面积比例
+    def _wet(self, c):
+        wet = 0.0
+        for i in range(len(c) - 1):
+            lo, hi = self.x[i], self.x[i + 1]
+            a, b = c[i], c[i + 1]
+            if a >= 0.15 and b >= 0.15:
+                wet += hi * hi - lo * lo
+            elif (a >= 0.15) != (b >= 0.15):
+                crossing = lo + (0.15 - a) / (b - a) * (hi - lo)
+                wet += crossing ** 2 - lo ** 2 if a >= 0.15 else hi ** 2 - crossing ** 2
+        return wet
+
+    # 生成当前时刻完整或紧凑的温湿场结果快照
+    def snapshot(self, t, temp, c, compact=False):
+        if compact:
+            return self._compact_snapshot(t, temp, c)
+        radius = self.inputs.radius(t, self.cfg.shrink)
+        return {'t': float(t), 'radius_cm': float(radius * 100.0),
+                'T': temp.tolist(), 'C': c.tolist(),
+                'max_C': float(c.max()), 'wet_fraction': float(self._wet(c)),
+                'mean_C': float(2.0 * self.volume @ c),
+                'x': self.x.tolist()}
+
+    # 按短周期、分钟级和关键时刻三种频率记录仿真结果
+    def _record(self, t, temp, c, short, long, summary, initial=False):
+        cfg = self.cfg
+        compact = cfg.compact_output
+        if cfg.keep_short and (initial or abs(t / cfg.output_stride -
+                                             round(t / cfg.output_stride)) < 1e-8):
+            short.append(self.snapshot(t, temp, c, compact=compact))
+        if initial or abs(t / 60.0 - round(t / 60.0)) < 1e-8:
+            long.append(self.snapshot(t, temp, c, compact=False))
+        desired = {100, 300, 600, 900, 1200, 1500, 1800, 3600, 5400,
+                   7200, 9000, 10800}
+        if any(abs(t - s) < 1e-8 for s in desired) or abs(t / 21600.0 -
+                                                        round(t / 21600.0)) < 1e-8:
+            summary[str(round(t))] = self.snapshot(t, temp, c, compact=False)
+
+
+    # 在首次跨越干燥阈值的时间步内用二分法定位终止时刻
+    def _locate_endpoint(self, t, old_t, old_c, prev_t, prev_c, previous_dt,
+                         right_dt, right_t, right_c):
+        left = 0.0
+        right = right_dt
+        left_max = float(old_c.max())
+        rt, rc = right_t, right_c
+        limit = 1e-10 * max(1.0, float(old_c.max()))
+        # 逐步缩小“未干燥—已干燥”时间区间，直至满足端点时间容差
+        while right - left > self.cfg.endpoint_tolerance:
+            mid = (left + right) / 2.0
+            mt, mc, _, _ = self._advance_once(
+                t, old_t, old_c, prev_t, prev_c, previous_dt, mid)
+            if float(mc.max()) > float(old_c.max()) + limit:
+                raise StepFailure('endpoint indicator is not monotone')
+            if mc.max() < 0.15:
+                right, rt, rc = mid, mt, mc
+            else:
+                left, left_max = mid, float(mc.max())
+        return rt, rc, {'left_s': float(t + left), 'right_s': float(t + right),
+                        'left_max_C': left_max, 'right_max_C': float(rc.max())}
+
+
+    # ==================== 主时间推进过程 ====================
+    # 从初始温湿状态出发推进至干燥终点或最大模拟时间，并汇总全过程结果
+    def run(self):
+        cfg = self.cfg
+        started = time.perf_counter()
+        # 初始化时间、温度场、含水率场及 BDF 历史状态
+        t = 0.0
+        temp = np.full(cfg.n + 1, 28.0)
+        c = np.full(cfg.n + 1, 2.55)
+        prev_t = prev_c = None
+        previous_dt = None
+        # 初始化多时间尺度输出容器与首个状态快照
+        short, long, summary = [], [], {}
+        self._record(t, temp, c, short, long, summary, initial=True)
+        # 初始化全过程极值、单调性、终点与时间步统计量
+        minc = maxc = 2.55
+        mint = maxt = 28.0
+        radial_violation = 0.0
+        endpoint = None
+        accepted = 0
+        min_dt_seen = np.inf
+        max_dt_seen = 0.0
+        # 主时间循环：根据阶段、输出时刻和关键时刻共同确定下一步步长
+        while t < cfg.max_time - 1e-8:
+            # 早期采用小步长、后期采用大步长，并保证精确落在输出网格上
+            base = cfg.early_dt if t < 10800.0 - 1e-8 else cfg.late_dt
+            stride = 1.0 if cfg.output_stride == 1 else 60.0
+            next_output = (np.floor((t + 1e-8) / stride) + 1.0) * stride
+            dt = min(base, cfg.max_time - t, next_output - t)
+            # 强制时间步精确命中题目关注的关键时刻
+            targets = [s - t for s in (100, 300, 600, 900, 1200, 1500, 1800,
+                                       3600, 5400, 7200, 9000, 10800)
+                       if s > t + 1e-8]
+            if targets:
+                dt = min(dt, min(targets))
+            # 完成一次带误差控制的自适应时间推进
+            try:
+                nt, nc, used_dt, method, step_error, _ = self._step_with_error(
+                    t, temp, c, prev_t, prev_c, previous_dt, dt)
+            except StepFailure:
+                raise
+            # 首次达到整体含水率阈值时，进一步定位精确干燥终点
+            if cfg.stop_dry and nc.max() < 0.15:
+                nt, nc, endpoint = self._locate_endpoint(
+                    t, temp, c, prev_t, prev_c, previous_dt, used_dt, nt, nc)
+                used_dt = endpoint['right_s'] - t
+            # 接受新状态并更新 BDF 历史信息
+            prev_t, prev_c, previous_dt = temp, c, used_dt
+            temp, c = nt, nc
+            t += used_dt
+            # 消除浮点误差，使输出时刻严格落在预定时间网格
+            if abs(t - next_output) <= 1e-6:
+                t = float(next_output)
+            # 更新步数、时间离散方法及时间步范围统计
+            accepted += 1
+            self.stats['steps'] += 1
+            if method == 'bdf2':
+                self.stats['bdf2_steps'] += 1
+            else:
+                self.stats['euler_steps'] += 1
+            min_dt_seen = min(min_dt_seen, used_dt)
+            max_dt_seen = max(max_dt_seen, used_dt)
+            # 更新温湿场全过程极值与径向单调性指标
+            minc = min(minc, float(c.min()))
+            maxc = max(maxc, float(c.max()))
+            mint = min(mint, float(temp.min()))
+            maxt = max(maxt, float(temp.max()))
+            radial_violation = max(radial_violation, float(np.diff(c).max()))
+            # 按预设频率保存当前状态；达到干燥终点后结束推进
+            self._record(t, temp, c, short, long, summary)
+            if endpoint:
+                break
+        # 构造最终状态并检查是否成功找到题设干燥终点
+        final = self.snapshot(t, temp, c, compact=False)
+        if cfg.stop_dry and endpoint is None:
+            raise RuntimeError('NO_ENDPOINT')
+        # 确保最终时刻被写入短周期和分钟级结果序列
+        if cfg.keep_short and (not short or short[-1]['t'] != t):
+            short.append(self.snapshot(t, temp, c, compact=cfg.compact_output))
+        if not long or long[-1]['t'] != t:
+            long.append(final)
+        # 汇总运行时间、状态极值、稳定性指标及实际时间步统计
+        self.stats.update({'runtime_s': time.perf_counter() - started,
+                           'min_C': minc, 'max_C': maxc, 'min_T': mint,
+                           'max_T': maxt,
+                           'max_radial_monotonicity_violation': radial_violation,
+                           'accepted_macro_steps': accepted,
+                           'actual_min_macro_dt': min_dt_seen,
+                           'actual_max_macro_dt': max_dt_seen})
+        # 返回配置、最终状态、终点区间、统计量及各时间尺度结果
+        return {'config': asdict(cfg), 'final': final, 'endpoint': endpoint,
+                'stats': self.stats, 'short': short, 'long': long,
+                'summaries': summary}
+
+
+
+# ==================== 结果后处理 ====================
+# 在给定快照中按实际半径插值提取指定径向距离处的温度或含水率
+def sample(snapshot, field, distances):
+    distances = np.asarray(distances, dtype=float)
+    # 紧凑快照直接使用预设采样网格进行二次插值
+    if 'sample_distances_cm' in snapshot:
+        raw_grid = np.asarray(snapshot['sample_distances_cm'], dtype=float)
+        raw_values = np.asarray(snapshot[field], dtype=object)
+        valid = np.array([v is not None and np.isfinite(float(v)) for v in raw_values])
+        if valid.sum() < 2:
+            return [None for _ in distances]
+        grid = raw_grid[valid]
+        values = np.asarray([float(v) for v in raw_values[valid]], dtype=float)
+        return [None if d > snapshot['radius_cm'] + 1e-10 else float(np.interp(d, grid, values))
+                for d in distances]
+    # 完整快照根据归一化径向坐标恢复实际距离后插值
+    radius = snapshot['radius_cm']
+    x = np.asarray(snapshot.get('x', np.linspace(0.0, 1.0, len(snapshot[field]))))
+    grid = x * radius
+    return [float(np.interp(d, grid, snapshot[field]))
+            if d <= radius + 1e-10 else None for d in distances]
+\end{Verbatim}
+
+\subsection{单算例运行与缓存来源管理（\texttt{run\_study.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from pathlib import Path
+from dataclasses import asdict
+import argparse
+import gzip
+import hashlib
+import json
+try:
+    from .model import Config, Solver
+except ImportError:  # direct execution from 改进模型/ remains supported
+    from model import Config, Solver
+
+ROOT = Path(__file__).resolve().parent
+CACHE = ROOT / 'runs'
+CACHE.mkdir(exist_ok=True)
+
+
+# 记录输入文件字节指纹，保证缓存结果与数据来源可追溯
+def provenance(paths):
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+
+
+# 记录题给结果模板指纹，防止复用不同输出合同的缓存
+def template_provenance():
+    return provenance(sorted((ROOT.parent / '附件' / '附件3').glob('result*.xlsx')))
+
+
+# ==================== 单算例求解与轨迹缓存 ====================
+def run_case(name, cfg):
+    path = CACHE / (name + '.json.gz')
+    source_hash = hashlib.sha256((ROOT / 'model.py').read_bytes()).hexdigest()
+    inputs = provenance([ROOT.parent / '附件' / n for n in ('附件1.xlsx', '附件2.xlsx')])
+    templates = template_provenance()
+    # 仅在内核、配置、输入及模板指纹全部一致时复用已有轨迹
+    if path.exists():
+        with gzip.open(path, 'rt', encoding='utf8') as f:
+            result = json.load(f)
+        if (result.get('source_hash') == source_hash
+                and result.get('config') == asdict(cfg)
+                and result.get('input_sha256') == inputs
+                and result.get('template_sha256') == templates):
+            print('CACHED', name, round(result['final']['t'] / 3600, 6), flush=True)
+            return result
+    print('RUN', name, asdict(cfg), flush=True)
+    # 依据指定物性、边界与离散配置执行温湿耦合计算
+    result = Solver(cfg).run()
+    # 为计算轨迹附加源码、输入、模板和环境情景的来源记录
+    result['source_hash'] = source_hash
+    result['input_sha256'] = inputs
+    result['template_sha256'] = templates
+    result['scenario_id'] = cfg.environment
+    with gzip.open(path, 'wt', encoding='utf8') as f:
+        json.dump(result, f, ensure_ascii=False, separators=(',', ':'))
+    print('DONE', name, 'h=', result['final']['t'] / 3600,
+          'stats=', result['stats'], flush=True)
+    return result
+
+
+# ==================== 命令行参数与模型配置 ====================
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--name', required=True)
+    parser.add_argument('--material', type=int, default=3)
+    parser.add_argument('--shrink', action='store_true')
+    parser.add_argument('--n', type=int, default=80)
+    parser.add_argument('--power', type=float, default=2.0)
+    parser.add_argument('--early', type=float, default=1.0)
+    parser.add_argument('--late', type=float, default=15.0)
+    parser.add_argument('--max-time', type=float, default=7 * 86400.0)
+    parser.add_argument('--output-stride', type=int, default=60)
+    parser.add_argument('--keep-short', action='store_true')
+    parser.add_argument('--compact', action='store_true')
+    parser.add_argument('--environment', default='last')
+    args = parser.parse_args()
+    cfg = Config(material=args.material, shrink=args.shrink, n=args.n,
+                 grid_power=args.power, early_dt=args.early, late_dt=args.late,
+                 max_time=args.max_time, output_stride=args.output_stride,
+                 keep_short=args.keep_short, compact_output=args.compact,
+                 environment=args.environment)
+    run_case(args.name, cfg)
+\end{Verbatim}
+
+\subsection{四问算例配置与统一运行（\texttt{run\_all.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+# ==================== 模型配置与求解入口 ====================
+try:
+    from .model import Config
+    from .run_study import run_case
+except ImportError:  # direct execution from 改进模型/ remains supported
+    from model import Config
+    from run_study import run_case
+
+
+# 配置四问的材料类型、径向网格、收缩开关及强制输出时刻
+def configurations():
+    return {
+        # 问题1：固定半径预热阶段，计算至1800秒并逐秒保存
+        'q1_final': Config(material=1, n=160, grid_power=2.0,
+                           early_dt=1.0, late_dt=1.0, max_time=1800.0,
+                           stop_dry=False, keep_short=True,
+                           compact_output=False, output_stride=1),
+        # 问题2与问题3共用固定半径全过程轨迹，终点由全域含水率阈值确定
+        'q2_full': Config(material=3, n=160, grid_power=2.0,
+                           early_dt=1.0, late_dt=1.0,
+                           stop_dry=True, keep_short=True,
+                           compact_output=True, output_stride=1,
+                           environment='last'),
+        # 问题4：采用半径观测与材料4物性，按分钟保存状态
+        'q4_final': Config(material=4, shrink=True, n=160, grid_power=2.0,
+                           early_dt=1.0, late_dt=15.0,
+                           stop_dry=True, keep_short=False,
+                           compact_output=False, output_stride=60,
+                           environment='last'),
+        # 粗网格对照配置用于检查空间离散影响，不替代正式结果
+        'q3_coarse': Config(material=3, n=40, grid_power=2.0,
+                            early_dt=1.0, late_dt=30.0, stop_dry=True),
+        'q4_coarse': Config(material=4, shrink=True, n=40, grid_power=2.0,
+                            early_dt=1.0, late_dt=30.0, stop_dry=True),
+    }
+
+
+# ==================== 按算例执行数值计算 ====================
+if __name__ == '__main__':
+    for name, cfg in configurations().items():
+        run_case(name, cfg)
+\end{Verbatim}
+
+\subsection{独立BDF2参考实现（\texttt{p2\_reference.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from dataclasses import asdict
+import time
+import numpy as np
+from scipy.linalg import solve_banded
+
+
+class ReferenceFailure(RuntimeError):
+    pass
+
+
+# ==================== 独立圆柱有限体积参考模型 ====================
+class IndependentBDF2:
+    # 建立表面加密节点、圆环控制体权重与界面积分节点
+    def __init__(self, cfg, inputs):
+        self.cfg, self.inputs = cfg, inputs
+        u = np.arange(cfg.n + 1) / cfg.n
+        self.x = 1 - (1-u)**cfg.grid_power
+        self.mid = .5*(self.x[1:] + self.x[:-1])
+        self.edge = np.concatenate(([0.], self.mid, [1.]))
+        self.dv = .5*(self.edge[1:]**2 - self.edge[:-1]**2)
+        nodes, weights = np.polynomial.legendre.leggauss(cfg.quadrature)
+        self.q, self.w = (nodes+1)/2, weights/2
+        self.stats = {'steps': 0, 'rejected_steps': 0, 'bdf2_steps': 0,
+                      'euler_steps': 0, 'iterations': 0,
+                      'max_mass_balance_residual': 0.,
+                      'max_moisture_equation_residual': 0.,
+                      'max_heat_equation_residual': 0.}
+
+    # 独立计算材料3/4的体积热容、导热系数与扩散模型参数
+    def material(self, concentration):
+        c = concentration
+        if self.cfg.material == 3:
+            return ((650+128*c)*(1450+2736*c/(1+c)),
+                    .21+.38*c/(1+c), 2.4e-3, .45)
+        if self.cfg.material == 4:
+            return ((760+90*c)*(1850+2150*c/(1+c)),
+                    .12+.20*c/(1+c), 4.2e-4, .30)
+        raise ValueError('P2 reference covers questions 3 and 4')
+
+    # 沿相邻节点含水率区间积分扩散系数，计算界面等效传递能力
+    def face_diffusion(self, c, temp):
+        _, _, prefactor, activation = self.material(c)
+        cq = (1-self.q)*c[:-1, None] + self.q*c[1:, None]
+        tf = .5*(temp[1:]+temp[:-1]) + 273.15
+        return (prefactor*np.exp(-activation/cq - 3850/tf[:, None])) @ self.w
+
+    # 根据相邻时间步比确定BDF2系数；历史不足或步长比越界时用隐式Euler
+    @staticmethod
+    def bdf(dt, last_dt, history, force_euler=False):
+        if force_euler or not history or last_dt is None:
+            return (1/dt, -1/dt, 0.), 'euler'
+        r = dt/last_dt
+        if not .5-1e-12 <= r <= 2+1e-12:
+            return (1/dt, -1/dt, 0.), 'euler'
+        return ((1+2*r)/(1+r)/dt, -(1+r)/dt, r*r/(1+r)/dt), 'bdf2'
+
+    # 将无量纲圆环换算为当前半径下的容量、界面导通量与表面交换系数
+    def geometry(self, coefficient, capacity, radius, boundary):
+        # Physical annuli, with the common 2*pi*length factor cancelled.
+        mass = capacity*self.dv*radius**2
+        conductance = self.mid*coefficient/np.diff(self.x)
+        return mass, conductance, radius*boundary
+
+    # 组装三对角离散方程，耦合历史状态与环境Robin边界
+    def solve(self, old, older, face, capacity, radius, boundary, ambient, bdf):
+        mass, conduct, outer = self.geometry(face, capacity, radius, boundary)
+        a0, a1, a2 = bdf
+        diagonal = a0*mass
+        diagonal[:-1] += conduct
+        diagonal[1:] += conduct
+        diagonal[-1] += outer
+        band = np.zeros((3, len(old)))
+        band[0, 1:] = -conduct
+        band[1] = diagonal
+        band[2, :-1] = -conduct
+        rhs = -mass*(a1*old+a2*older)
+        rhs[-1] += outer*ambient
+        return solve_banded((1, 1), band, rhs, check_finite=False)
+
+    # 由圆环蓄积项及界面通量差检查离散方程残差
+    def residual(self, new, old, older, face, capacity, radius, boundary, ambient, bdf):
+        mass, conduct, outer = self.geometry(face, capacity, radius, boundary)
+        flows = np.zeros(len(new)+1)
+        flows[1:-1] = conduct*np.diff(new)
+        flows[-1] = outer*(ambient-new[-1])
+        a0, a1, a2 = bdf
+        return (mass*(a0*new+a1*old+a2*older)-np.diff(flows))/radius**2
+
+    # ==================== 温湿耦合非线性迭代 ====================
+    def attempt(self, t, temp, c, older, last_dt, dt, euler=False):
+        cfg = self.cfg
+        bdf, method = self.bdf(dt, last_dt, older is not None, euler)
+        ot, oc = (temp, c) if older is None else older
+        ta, ca = self.inputs.boundary(t+dt, cfg.environment)
+        radius = self.inputs.radius(t+dt, cfg.shrink)
+        guess_t, guess_c = temp.copy(), c.copy()
+        before, damping = np.inf, 1.
+        # 更新含水率相关物性，交替求解温度与含水率直至状态和残差同时收敛
+        for iteration in range(1, cfg.max_iterations+1):
+            cap, k, _, _ = self.material(guess_c)
+            nt = self.solve(temp, ot, .5*(k[1:]+k[:-1]), cap,
+                            radius, 25., ta, bdf)
+            nc = self.solve(c, oc, self.face_diffusion(guess_c, nt),
+                            np.ones(len(c)), radius, 8e-7, ca, bdf)
+            if not np.isfinite(nt).all() or not np.isfinite(nc).all() or min(nc) <= 0:
+                raise ReferenceFailure('invalid state')
+            error = max(np.max(abs(nt-guess_t))/50, np.max(abs(nc-guess_c)))
+            if error <= cfg.tolerance:
+                cap, k, _, _ = self.material(nc)
+                rt = self.residual(nt, temp, ot, .5*(k[1:]+k[:-1]), cap,
+                                   radius, 25., ta, bdf)
+                rc = self.residual(nc, c, oc, self.face_diffusion(nc, nt),
+                                   np.ones(len(c)), radius, 8e-7, ca, bdf)
+                if max(np.max(abs(rt))/50, np.max(abs(rc))) <= cfg.residual_tolerance:
+                    if np.max(np.diff(nc)) > 1e-10*max(1., np.max(nc)):
+                        raise ReferenceFailure('radial order')
+                    self.stats['iterations'] += iteration
+                    for name, value in [('heat', np.max(abs(rt))), ('moisture', np.max(abs(rc)))]:
+                        key = f'max_{name}_equation_residual'
+                        self.stats[key] = max(self.stats[key], float(value))
+                    self.stats['max_mass_balance_residual'] = max(
+                        self.stats['max_mass_balance_residual'], abs(float(sum(rc))))
+                    return nt, nc, method
+            # 迭代误差增大时降低更新幅度，抑制非线性迭代振荡
+            if error > 1.05*before:
+                damping = .5
+            guess_t += damping*(nt-guess_t)
+            guess_c += damping*(nc-guess_c)
+            before = error
+        raise ReferenceFailure('nonlinear iteration')
+
+    # 非线性候选步失败时以隐式Euler回退，保留原状态重新计算
+    def advance(self, *args):
+        try:
+            return self.attempt(*args)
+        except ReferenceFailure:
+            return self.attempt(*args, euler=True)
+
+    # 比较整步与两次半步状态，超出误差容限或可行性约束时缩短步长
+    def controlled_step(self, t, temp, c, older, last_dt, dt):
+        cfg = self.cfg
+        for retry in range(cfg.max_retries+1):
+            try:
+                nt, nc, method = self.advance(t, temp, c, older, last_dt, dt)
+                if older is None:
+                    return nt, nc, method, dt
+                ht, hc, _ = self.advance(t, temp, c, older, last_dt, dt/2)
+                et, ec, _ = self.advance(t+dt/2, ht, hc, (temp, c), dt/2, dt/2)
+                limit = 1e-10*max(1., float(max(c)))
+                if max(hc)>max(c)+limit or max(ec)>max(hc)+limit:
+                    raise ReferenceFailure('temporal order')
+                error = max(np.max(abs(nt-et))/50, np.max(abs(nc-ec)))
+                if error <= cfg.step_tolerance:
+                    return nt, nc, method, dt
+                if dt <= cfg.min_dt*1.0000001:
+                    raise ReferenceFailure('error at minimum step')
+                dt = max(cfg.min_dt, min(dt/2, .9*dt*np.sqrt(cfg.step_tolerance/error)))
+                self.stats['rejected_steps'] += 1
+            except ReferenceFailure:
+                if retry == cfg.max_retries or dt <= cfg.min_dt*1.0000001:
+                    raise
+                dt = max(cfg.min_dt, dt/2)
+                self.stats['rejected_steps'] += 1
+        raise ReferenceFailure('retry budget')
+
+    # 首次跨越严格干燥阈值后用历史状态重算并二分定位事件区间
+    def endpoint(self, t, temp, c, older, last_dt, dt, nt, nc):
+        lo, hi, clo = 0., dt, float(max(c))
+        while hi-lo > self.cfg.endpoint_tolerance:
+            middle = (lo+hi)/2
+            mt, mc, _ = self.advance(t, temp, c, older, last_dt, middle)
+            if max(mc)>max(c)+1e-10*max(1., max(c)):
+                raise ReferenceFailure('event order')
+            if max(mc)<.15:
+                hi, nt, nc = middle, mt, mc
+            else:
+                lo, clo = middle, float(max(mc))
+        return nt, nc, {'left_s': t+lo, 'right_s': t+hi,
+                         'left_max_C': clo, 'right_max_C': float(max(nc))}
+
+    # ==================== 状态采样与过程指标 ====================
+    def snapshot(self, t, temp, c):
+        # 按分段线性径向含水率计算未达标截面积比例，保留阈值相等区域
+        wet = 0.
+        for j in range(len(c)-1):
+            left, right, a, b = self.x[j], self.x[j+1], c[j], c[j+1]
+            if a >= .15 and b >= .15:
+                wet += right**2-left**2
+            elif (a >= .15) != (b >= .15):
+                crossing = left+(.15-a)*(right-left)/(b-a)
+                wet += crossing**2-left**2 if a >= .15 else right**2-crossing**2
+        # 返回终点、温湿场、过程指标与数值诊断，供实现一致性检验
+        return dict(t=float(t), radius_cm=100*self.inputs.radius(t, self.cfg.shrink),
+                    x=self.x.tolist(), T=temp.tolist(), C=c.tolist(),
+                    max_C=float(max(c)), mean_C=float(2*self.dv@c), wet_fraction=float(wet))
+
+    # ==================== 主时间推进过程 ====================
+    def run(self):
+        cfg = self.cfg
+        started = time.perf_counter()
+        t, last_dt, older, endpoint = 0., None, None, None
+        temp, c = np.full(cfg.n+1, 28.), np.full(cfg.n+1, 2.55)
+        summaries = {'0': self.snapshot(0, temp, c)}
+        desired = (100, 300, 600, 900, 1200, 1500, 1800, 3600, 5400, 7200, 9000, 10800)
+        min_c, max_c, min_t, max_t, radial = 2.55, 2.55, 28., 28., 0.
+        # 逐步逼近强制采样时刻并监测全域最大含水率的首次严格达标
+        while t < cfg.max_time-1e-8:
+            stride = 1. if cfg.output_stride == 1 else 60.
+            landing = (np.floor((t+1e-8)/stride)+1)*stride
+            dt = min(cfg.early_dt if t<10800-1e-8 else cfg.late_dt,
+                     landing-t, cfg.max_time-t,
+                     min([s-t for s in desired if s>t+1e-8] or [cfg.max_time]))
+            nt, nc, method, dt = self.controlled_step(t, temp, c, older, last_dt, dt)
+            if cfg.stop_dry and max(nc)<.15:
+                nt, nc, endpoint = self.endpoint(t, temp, c, older, last_dt, dt, nt, nc)
+                dt = endpoint['right_s']-t
+            # 接受新时间层状态，更新BDF历史及实际步长
+            older, temp, c, last_dt = (temp, c), nt, nc, dt
+            t += dt
+            if abs(t-landing)<=1e-6:
+                t = float(landing)
+            self.stats['steps'] += 1
+            self.stats[method+'_steps'] += 1
+            min_c, max_c = min(min_c, float(min(c))), max(max_c, float(max(c)))
+            min_t, max_t = min(min_t, float(min(temp))), max(max_t, float(max(temp)))
+            radial = max(radial, float(max(np.diff(c))))
+            if abs(t/21600-round(t/21600))<1e-9:
+                summaries[str(round(t))] = self.snapshot(t, temp, c)
+            if endpoint is not None:
+                break
+        if cfg.stop_dry and endpoint is None:
+            raise RuntimeError('NO_ENDPOINT')
+        self.stats.update(runtime_s=time.perf_counter()-started, min_C=min_c,
+                          max_C=max_c, min_T=min_t, max_T=max_t,
+                          max_radial_monotonicity_violation=radial)
+        return dict(config=asdict(cfg), final=self.snapshot(t, temp, c),
+                    endpoint=endpoint, stats=self.stats, summaries=summaries)
+\end{Verbatim}
+
+\subsection{容差对照与边界系数情景计算（\texttt{p2\_study.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict
+from pathlib import Path
+import argparse
+import hashlib
+import json
+import time
+import numpy as np
+from model import Config, Inputs, Solver
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / 'p2'
+
+
+# ==================== 边界系数情景模型 ====================
+class BoundaryStudy(Solver):
+    def __init__(self, cfg, inputs=None, h_factor=1., hm_factor=1.):
+        super().__init__(cfg, inputs)
+        self.h_factor, self.hm_factor = h_factor, hm_factor
+
+    # 分别施加换热与传质系数倍数，仅用于给定情景比较
+    def scaled_boundary(self, value):
+        if value == 25.:
+            return value * self.h_factor
+        if value == 8e-7:
+            return value * self.hm_factor
+        raise ValueError('unexpected boundary coefficient')
+
+    def _linear_general(self, old, previous, faces, capacity, boundary,
+                        ambient, radius, dt, a0, a1, a2):
+        return super()._linear_general(old, previous, faces, capacity,
+            self.scaled_boundary(boundary), ambient, radius, dt, a0, a1, a2)
+
+    def _residual(self, old, previous, new, faces, capacity, boundary,
+                  ambient, radius, dt, a0, a1, a2):
+        return super()._residual(old, previous, new, faces, capacity,
+            self.scaled_boundary(boundary), ambient, radius, dt, a0, a1, a2)
+
+    # 执行候选时间步并以情景传质系数核对有效浓度离散平衡
+    def _attempt(self, t, old_t, old_c, prev_t, prev_c, previous_dt,
+                 dt, force_method=None):
+        old_balance = self.stats['max_mass_balance_residual']
+        answer = super()._attempt(t, old_t, old_c, prev_t, prev_c,
+                                  previous_dt, dt, force_method)
+        # The frozen kernel's scalar diagnostic uses the nominal hm. Correct
+        # that diagnostic as well as the two assembled boundary conditions.
+        a0, a1, a2, _ = self._bdf_coefficients(
+            dt, previous_dt, prev_c is not None, answer[2])
+        c = answer[1]
+        ca = self.inputs.boundary(t + dt, self.cfg.environment)[1]
+        radius = self.inputs.radius(t + dt, self.cfg.shrink)
+        balance = abs(float(self.volume @ (a0*c + a1*old_c +
+            a2*(old_c if prev_c is None else prev_c)) +
+            8e-7*self.hm_factor/radius*(c[-1]-ca)))
+        self.stats['max_mass_balance_residual'] = max(old_balance, balance)
+        return answer
+
+    # 减少诊断状态存储，保留求解器原有强制时间落点规则
+    def _record(self, t, temp, c, short, long, summary, initial=False):
+        # Storage only: cfg.output_stride still controls the same 1 s/60 s
+        # mandatory landing grid inside Solver.run, including Q3 after 3 h.
+        self.last_state = (t, temp, c)
+        if initial or abs(t/21600-round(t/21600)) < 1e-9:
+            summary[str(round(t))] = self.snapshot(t, temp, c)
+
+
+# 设置问题3/4共同的161节点与终点合同，容差用于时间步收敛对照
+def config_for(question, eta=1e-4):
+    moving = question == 4
+    return Config(material=4 if moving else 3, shrink=moving, n=160,
+        grid_power=2., early_dt=1., late_dt=15. if moving else 1.,
+        output_stride=60 if moving else 1, step_tolerance=eta,
+        keep_short=False, compact_output=not moving,
+        max_time=259200. if moving else 604800.)
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# ==================== 情景算例与独立参考计算 ====================
+def run_case(spec):
+    label, question, eta, hf, mf, independent = spec
+    cfg = config_for(question, eta)
+    sources = ['model.py', 'p2_study.py']
+    # 选取独立实现或主求解器边界扩展；一致性只验证实现而非物理真实性
+    if independent:
+        sources.append('p2_reference.py')
+    # 绑定系数、配置及源码和附件指纹，避免错误复用旧情景记录
+    signature = {'config': asdict(cfg), 'h_factor': hf, 'hm_factor': mf,
+        'source_sha256': {p: sha(ROOT/p) for p in sources},
+        'input_sha256': {p: sha(ROOT.parent/'附件'/p)
+                         for p in ('附件1.xlsx', '附件2.xlsx')}}
+    path = OUT / 'runs' / (label + '.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        cached = json.loads(path.read_text(encoding='utf-8'))
+        if cached.get('signature') == signature:
+            return label, cached['final']['t']/3600, 'cache'
+    started = time.perf_counter()
+    if independent:
+        from p2_reference import IndependentBDF2
+        solver = IndependentBDF2(cfg, Inputs())
+    else:
+        solver = BoundaryStudy(cfg, h_factor=hf, hm_factor=mf)
+    # 计算到首次全域达标；允许将观测期限内未达标的非独立算例记录为右删失
+    try:
+        result = solver.run()
+        result['status'] = 'endpoint_reached'
+    except RuntimeError as error:
+        if str(error) != 'NO_ENDPOINT' or independent:
+            raise
+        t, temp, c = solver.last_state
+        result = {'status': 'right_censored', 'endpoint': None,
+                  'final': solver.snapshot(t, temp, c), 'stats': solver.stats}
+    # ==================== 诊断记录输出 ====================
+    result.update(signature=signature, label=label,
+                  wall_s=time.perf_counter()-started)
+    tmp = path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(path)
+    return label, result['final']['t']/3600, result['status']
+
+
+# 组织收紧容差、九种边界情景及独立BDF2参考三组数值检验
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--workers', type=int, default=3)
+    parser.add_argument('--group', choices=['scan', 'tight', 'reference', 'all'], default='all')
+    args = parser.parse_args()
+    cases = []
+    if args.group in ('tight', 'all'):
+        cases += [(f'q{q}_tight', q, 1e-5, 1., 1., False) for q in (3, 4)]
+    # 3×3倍数网格是有限情景分析，不提供统计置信区间或全局误差界
+    if args.group in ('scan', 'all'):
+        cases += [(f'q{q}_h{h:g}_hm{m:g}', q, 1e-4, h, m, False)
+                  for q in (3, 4) for h in (.5, 1., 2.) for m in (.5, 1., 2.)]
+    if args.group in ('reference', 'all'):
+        cases += [(f'q{q}_reference', q, 1e-4, 1., 1., True) for q in (3, 4)]
+    print(f'P2: {len(cases)} cases, {args.workers} workers', flush=True)
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(run_case, spec): spec[0] for spec in cases}
+        for future in as_completed(futures):
+            print(future.result(), flush=True)
+
+
+if __name__ == '__main__':
+    main()
+\end{Verbatim}
+
+\subsection{全过程结果表导出（\texttt{build\_outputs.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+import gzip
+import json
+import shutil
+from pathlib import Path
+import numpy as np
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.utils import get_column_letter
+from model import sample
+
+ROOT=Path(__file__).resolve().parent
+
+# 按规定时空采样合同导出结果：固定位置含水率与移动表面状态分别记录
+def write_book(name,sheets):
+    # ==================== 结果矩阵与Excel表格输出 ====================
+    wb=Workbook(write_only=True)
+    for title,states,field,moving in sheets:
+        ws=wb.create_sheet(title)
+        ws.freeze_panes='B2';ws.column_dimensions['A'].width=25
+        for j in range(2,25):ws.column_dimensions[get_column_letter(j)].width=12
+        # 设置中心至表面的物理距离列；收缩情形追加真实表面及半径列
+        header=['时间/s；距离/cm']+[round(x/10,1) for x in range(21)]
+        if moving:header+=['药材表面','表面半径/cm']
+        ws.append(header)
+        # 从已保存轨迹采样，不重新求解；域外位置保持为空
+        for state in states:
+            vals=sample(state,field,np.arange(21)/10)
+            if moving:vals+=[state[field][-1],state['radius_cm']]
+            # 仅对输出状态保留四位小数，干燥事件仍以未舍入状态判定
+            values=[state['t']]+[None if v is None else round(v,4) for v in vals]
+            cells=[WriteOnlyCell(ws,value=v) for v in values]
+            for c in cells:c.number_format='0.0000'
+            ws.append(cells)
+    path=ROOT/name
+    wb.save(path)
+    (ROOT/'results').mkdir(exist_ok=True)
+    shutil.copy2(path,ROOT/'results'/name)
+
+# ==================== 全过程结果后处理 ====================
+def main():
+    # 依次读取问题1、问题2/3共享轨迹及问题4收缩轨迹并生成四份结果表
+    for name,number in [('q1_final',1),('q2_full',2),('q4_final',4)]:
+        with gzip.open(ROOT/'runs'/f'{name}.json.gz','rt',encoding='utf-8') as f:
+            result=json.load(f)
+        if number in (1,2):
+            write_book(f'result{number}.xlsx',[(title,result['short'],field,False)
+                for title,field in [('温度','T'),('水分浓度','C')]])
+            if number==2:write_book('result3.xlsx',[('Sheet1',result['long'],'C',False)])
+        else:write_book('result4.xlsx',[('Sheet1',result['long'],'C',True)])
+        print('exported',name,flush=True)
+        del result
+
+if __name__=='__main__':main()
+\end{Verbatim}
+
+\subsection{观测数据、过程状态与结果可视化（\texttt{make\_figures.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from pathlib import Path
+import gzip, json, sys
+import numpy as np
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import shutil
+
+from model import ROOT, sample
+
+
+# 读取保存的正式数值轨迹，图像生成不重新执行模型求解
+def load(name):
+    with gzip.open(ROOT / 'runs' / f'{name}.json.gz', 'rt', encoding='utf8') as f:
+        return json.load(f)
+
+
+# 将同一图像导出多种格式，并复制论文使用的PDF图源
+def save(fig, stem):
+    for extension in ('pdf','svg','png'):
+        path=ROOT/'figures'/f'{stem}.{extension}'
+        fig.savefig(path,dpi=180,bbox_inches='tight')
+        if extension=='pdf':
+            target=ROOT.parent/'完整论文-LaTeX/figs'
+            target.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(path,target/path.name)
+    plt.close(fig)
+
+
+# ==================== 观测数据与模型背景图 ====================
+def main():
+    plt.rcParams.update({'font.family':['DejaVu Serif','SimSun'],
+        'font.size':11,'axes.unicode_minus':False,'mathtext.fontset':'dejavuserif',
+        'pdf.fonttype':42,'svg.fonttype':'path'})
+    q1, q2, q4 = load('q1_final'), load('q2_full'), load('q4_final')
+    q3 = q2
+    figdir = ROOT / 'figures'
+    figdir.mkdir(exist_ok=True)
+    colors = ['#0072B2', '#D55E00', '#009E73', '#CC79A7']
+    # Raw data figures: observed environmental and radius data, plus derived ranges.
+    # q1: two observed air variables, separate panels because units differ.
+    from model import Inputs
+    inp = Inputs()
+    fig, ax = plt.subplots(1, 2, figsize=(7.2, 4.2), constrained_layout=True)
+    ax[0].plot(inp.air[:, 0] / 3600, inp.air[:, 1], color=colors[0])
+    ax[0].set(xlabel='时间 / h', ylabel='烘房温度 / °C', title='附件1：烘房温度')
+    ax[1].plot(inp.air[:, 0] / 3600, inp.air[:, 2], color=colors[2])
+    ax[1].set(xlabel='时间 / h', ylabel='有效水分浓度 / (kg/kg)', title='附件1：烘房水分浓度')
+    for a in ax: a.spines[['top', 'right']].set_visible(False)
+    save(fig, 'raw_q1_environment')
+    # q2: input range summary as a relationship between environment variables.
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(inp.air[:, 1], inp.air[:, 2], color=colors[0], lw=1.0, marker='o', ms=1.5)
+    ax.set(xlabel='烘房温度 / °C', ylabel='烘房水分浓度 / (kg/kg)', title='附件1：环境状态关系')
+    ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'raw_q2_environment_relation')
+    # q3: radius-independent observed data context.
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.scatter(inp.radii[:, 0] / 3600, inp.radii[:, 1], s=12, color=colors[1], label='观测')
+    ax.plot(inp.radii[:, 0] / 3600, inp.radii[:, 1], color=colors[1], alpha=.6)
+    ax.set(xlabel='时间 / h', ylabel='半径 / cm', title='附件2：药材半径观测与线性插值')
+    ax.legend(frameon=False); ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'raw_q3_radius')
+    # q4 raw: combined normalized radius and environmental temperature.
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(inp.radii[:, 0] / 3600, inp.radii[:, 1] / inp.radii[0, 1], color=colors[1])
+    ax.set(xlabel='时间 / h', ylabel='R(t) / R(0)', title='收缩几何的无量纲半径')
+    ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'raw_q4_shrinkage')
+
+    # Process figures.
+    # ==================== 温湿状态与收缩过程图 ====================
+    s1 = q1['long']
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    tt = np.array([s['t'] for s in s1]) / 3600
+    ax.plot(tt, [s['T'][0] for s in s1], color=colors[0], label='中心')
+    ax.plot(tt, [s['T'][-1] for s in s1], color=colors[1], label='表面')
+    ax.set(xlabel='时间 / h', ylabel='温度 / °C', title='问题1：预热阶段中心—表面温度')
+    ax.legend(frameon=False); ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'process_q1_temperature')
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ss = q2['long']; tt = np.array([s['t'] for s in ss]) / 3600
+    ax.plot(tt, [s['C'][0] for s in ss], color=colors[0], label='中心')
+    ax.plot(tt, [s['C'][-1] for s in ss], color=colors[1], label='表面')
+    ax.set(xlabel='时间 / h', ylabel='干基含水率 / (kg/kg)', title='问题2—3：固定半径失水过程')
+    # 低含水率阶段采用对数纵轴展示，避免中心与表面曲线差异被掩盖
+    ax.set_yscale('log'); ax.legend(frameon=False); ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'process_q2_moisture')
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(tt, [100*s['wet_fraction'] for s in ss], color=colors[2])
+    ax.axhline(0, color='#555', lw=.8)
+    ax.set(xlabel='时间 / h', ylabel='未达标截面积比例 / %', title='问题3：未达标核心面积变化')
+    ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'process_q3_wet_fraction')
+    ss4 = q4['long']; tt4 = np.array([s['t'] for s in ss4]) / 3600
+    fig, ax = plt.subplots(1, 2, figsize=(7.2, 4.2), constrained_layout=True)
+    ax[0].plot(tt4, [s['radius_cm'] for s in ss4], color=colors[1])
+    ax[0].set(xlabel='时间 / h', ylabel='半径 / cm', title='收缩半径')
+    ax[1].plot(tt4, [s['C'][0] for s in ss4], color=colors[0])
+    ax[1].set(xlabel='时间 / h', ylabel='中心含水率 / (kg/kg)', title='中心含水率')
+    for a in ax: a.spines[['top', 'right']].set_visible(False)
+    save(fig, 'process_q4_shrinkage_moisture')
+
+    # Result figures: spatial fields and endpoint profiles.
+    # ==================== 径向结果与干燥终点图 ====================
+    dist = np.arange(0, 2.001, .1)
+    snap1 = q1['summaries']['1800']; valsT = sample(snap1, 'T', dist); valsC = sample(snap1, 'C', dist)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(dist, valsT, color=colors[0], label='温度')
+    ax.set(xlabel='到中心距离 / cm', ylabel='温度 / °C', title='问题1：1800 s径向温度结果')
+    ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'result_q1_profile')
+    snap2 = q2['summaries']['10800']; vals = sample(snap2, 'C', dist)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(dist, vals, color=colors[2], marker='o', ms=2, label='3 h')
+    ax.set(xlabel='到中心距离 / cm', ylabel='干基含水率 / (kg/kg)', title='问题2：3 h径向含水率结果')
+    ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'result_q2_profile')
+    vals = sample(q2['final'], 'C', dist)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(dist, vals, color=colors[0], marker='o', ms=2)
+    ax.axhline(.15, color='#555', ls='--', label='阈值 0.15')
+    ax.set(xlabel='到中心距离 / cm', ylabel='干基含水率 / (kg/kg)', title='问题3：首次达标时径向含水率')
+    ax.legend(frameon=False); ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'result_q3_endpoint')
+    # 问题4以固定物理距离展示终点剖面，域外位置不外推
+    vals = sample(q4['final'], 'C', dist)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    ax.plot(dist, vals, color=colors[1], marker='o', ms=2, label='有效域采样')
+    ax.axhline(.15, color='#555', ls='--', label='阈值 0.15')
+    ax.set(xlabel='固定物理距离 / cm', ylabel='干基含水率 / (kg/kg)', title='问题4：收缩终点物理距离剖面')
+    ax.legend(frameon=False); ax.spines[['top', 'right']].set_visible(False)
+    save(fig, 'result_q4_endpoint')
+    print('figures generated: 12 logical figures')
+if __name__ == '__main__':
+    main()
+\end{Verbatim}
+
+\subsection{结果表与轨迹独立全量核验（\texttt{verify\_outputs.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from pathlib import Path
+from bisect import bisect_right
+from dataclasses import asdict
+from datetime import datetime,timezone
+import gzip,hashlib,json,math
+import openpyxl
+import numpy as np
+from model import Inputs
+from run_all import configurations
+
+ROOT=Path(__file__).resolve().parent
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+
+# 独立按当前物理半径插值轨迹，域外结果保持为空且不调用导出采样器
+def interp(snapshot,field,distance):
+    radius=snapshot['radius_cm']
+    if distance>radius+1e-10:return None
+    if 'sample_distances_cm' in snapshot:
+        grid=snapshot['sample_distances_cm']
+    else:grid=[x*radius for x in snapshot['x']]
+    values=snapshot[field]
+    if distance>=grid[-1]:return values[-1]
+    j=max(0,bisect_right(grid,distance)-1)
+    return values[j]+(values[j+1]-values[j])*(distance-grid[j])/(grid[j+1]-grid[j])
+
+# ==================== 结果表与原始轨迹独立核验 ====================
+def main():
+    report={'status':'running','sheets':[],'numeric_values_compared':0,
+            'max_state_rounding_error':0.,'source_sha256':sha(ROOT/'model.py')}
+    inp=Inputs()
+    # 核对四份Excel对应的求解轨迹、模型配置及输入来源
+    for case,numbers in [('q1_final',[1]),('q2_full',[2,3]),('q4_final',[4])]:
+        with gzip.open(ROOT/'runs'/f'{case}.json.gz','rt',encoding='utf-8') as f:run=json.load(f)
+        assert run['source_hash']==sha(ROOT/'model.py')
+        assert run['config']==asdict(configurations()[case])
+        for name,digest in run['input_sha256'].items():assert sha(ROOT.parent/'附件'/name)==digest
+        # 核验严格阈值跨越、事件区间宽度及终点右端时刻
+        if run['endpoint']:
+            e=run['endpoint']
+            assert 0<e['right_s']-e['left_s']<=.020001
+            assert e['left_max_C']>=.15>e['right_max_C']
+            assert run['final']['t']==e['right_s']
+        for number in numbers:
+            states=run['short'] if number<=2 else run['long']
+            step=1 if number<=2 else 60
+            end=run['final']['t']
+            # 按题给秒/分钟间隔构造输出合同，并追加实际非整点终点
+            times=list(range(0,int(end)+1,step))
+            if times[-1]!=end:times.append(end)
+            assert [s['t'] for s in states]==times
+            book=ROOT/f'result{number}.xlsx'
+            wb=openpyxl.load_workbook(book,read_only=True,data_only=False)
+            names=['温度','水分浓度'] if number<=2 else ['Sheet1']
+            assert wb.sheetnames==names
+            for title,field in zip(names,['T','C'] if number<=2 else ['C']):
+                ws=wb[title]
+                rows=iter(ws.iter_rows())
+                header=next(rows)
+                assert [c.value for c in header[1:22]]==[i/10 for i in range(21)]
+                count=1
+                # 逐时间层核对物理距离采样、表面位置和域外空值
+                for snap in states:
+                    row=next(rows)
+                    assert len(row)==(24 if number==4 else 22)
+                    assert abs(row[0].value-snap['t'])<1e-8
+                    if number==4:
+                        assert abs(snap['radius_cm']-100*inp.radius(snap['t'],True))<1e-12
+                    for j in range(1,len(row)):
+                        expected=interp(snap,field,(j-1)/10) if j<=21 else (snap[field][-1] if j==22 else snap['radius_cm'])
+                        cell=row[j];value=cell.value
+                        # 分别检查域外留空与域内有限数值、四位小数及舍入误差
+                        if expected is None:
+                            assert value is None,(number,count,j,value)
+                        else:
+                            assert cell.data_type!='f'
+                            assert isinstance(value,(int,float)) and math.isfinite(value)
+                            assert cell.number_format=='0.0000'
+                            delta=abs(value-expected)
+                            assert delta<=.00005000001,(number,count,j,value,expected)
+                            assert abs(value*1e4-round(value*1e4))<1e-6
+                            report['max_state_rounding_error']=max(report['max_state_rounding_error'],delta)
+                            report['numeric_values_compared']+=1
+                    count+=1
+                assert next(rows,None) is None
+                report['sheets'].append({'file':book.name,'sheet':title,'rows':count,
+                    'columns':24 if number==4 else 22,'last_time_s':end})
+                print(number,title,count,'passed',flush=True)
+            wb.close()
+            assert sha(book)==sha(ROOT/'results'/book.name)
+        for snap in run['long']:
+            for field in ('C','T'):assert np.isfinite(snap[field]).all()
+            assert min(snap['C'])>0 and max(snap['C'])<=2.55+1e-10
+            assert -1e-12<=snap['wet_fraction']<=1+1e-12
+        del run
+    # ==================== 全量验证记录与文件指纹输出 ====================
+    report.update(status='passed',completed_utc=datetime.now(timezone.utc).isoformat(),
+        verifier_sha256=sha(Path(__file__)),
+        xlsx_sha256={f'result{i}.xlsx':sha(ROOT/f'result{i}.xlsx') for i in range(1,5)})
+    (ROOT/'verification.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    print(json.dumps(report,ensure_ascii=False),flush=True)
+
+if __name__=='__main__':main()
+\end{Verbatim}
+
+\subsection{P2数值证据汇总与情景图表（\texttt{p2\_report.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from pathlib import Path
+import json
+import hashlib
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+ROOT=Path(__file__).resolve().parent
+# ==================== 数值检验基准与算例合同 ====================
+BASE={3:205810.53125,4:182967.919921875}
+EXPECTED=[f'q{q}_{suffix}' for q in (3,4) for suffix in
+          ['tight','reference']+[f'h{h:g}_hm{m:g}' for h in (.5,1.,2.) for m in (.5,1.,2.)]]
+
+# ==================== 数值证据回读与一致性检查 ====================
+def main():
+    runs={p.stem:json.loads(p.read_text(encoding='utf-8')) for p in (ROOT/'p2/runs').glob('*.json')}
+    missing=[name for name in EXPECTED if name not in runs]
+    lines=['# P2 数值终检记录','', '模型 v0.4；发布 v0.6-submit。161 节点，表面加密指数 2，事件区间不宽于 0.02 s。',
+        '问题 3 全程逐秒落点；问题 4 每分钟落点、前 3 h 上限 1 s、后期上限 15 s。',
+        '诊断只减少状态存储，不改变积分落点。容差与独立对照的终点差验收线为 1 s；独立状态每 6 h 对照，温差线 1e-4 °C、含水率差线 1e-7 kg/kg。','',
+        '| 问题 | 基准/h | 收紧 η/h | 终点差/s | 独立 BDF2/h | 终点差/s |','| --- | --- | --- | --- | --- | --- |']
+    checks=[]; metrics={}
+    # Evidence is accepted only while its producing code and input bytes match.
+    # 核对产生数值证据的源码和题给输入指纹，注释变更也会使字节指纹改变
+    for label,r in runs.items():
+        if label not in EXPECTED: continue
+        for name,digest in r['signature']['source_sha256'].items():
+            assert hashlib.sha256((ROOT/name).read_bytes()).hexdigest()==digest,(label,name)
+        for name,digest in r['signature']['input_sha256'].items():
+            assert hashlib.sha256((ROOT.parent/'附件'/name).read_bytes()).hexdigest()==digest,(label,name)
+    # 比较收紧容差与独立参考的终点时间及共同采样时刻的温湿状态
+    for q in (3,4):
+        tight=runs.get(f'q{q}_tight'); ref=runs.get(f'q{q}_reference')
+        b=runs.get(f'q{q}_h1_hm1')
+        fmt=lambda r: f'{r["final"]["t"]/3600:.9f}' if r else '待完成'
+        diff=lambda r: f'{r["final"]["t"]-BASE[q]:+.6f}' if r else '待完成'
+        lines.append(f'| {q} | {BASE[q]/3600:.9f} | {fmt(tight)} | {diff(tight)} | {fmt(ref)} | {diff(ref)} |')
+        if tight: checks.append(abs(tight['final']['t']-BASE[q])<=1.)
+        if ref: checks.append(abs(ref['final']['t']-BASE[q])<=1.)
+        if b:
+            checks.append(abs(b['final']['t']-BASE[q])<1e-7)
+        if b and ref:
+            times=sorted(set(b['summaries'])&set(ref['summaries']),key=int)
+            errs={f:max(float(np.max(abs(np.asarray(b['summaries'][t][f])-ref['summaries'][t][f]))) for t in times) for f in ('T','C')}
+            metrics[str(q)]={'time_difference_s':ref['final']['t']-BASE[q],
+                             'sample_times_s':list(map(int,times)), 'max_abs_difference':errs}
+            checks += [errs['T']<=1e-4,errs['C']<=1e-7]
+    lines += ['','## 3×3 边界扫描','', '| h/h0 | hm/hm0 | 问题3/h | 问题4/h |','| --- | --- | --- | --- |']
+    # 汇总九种系数组合的干燥时长，不将情景范围解释为置信区间
+    for h in (.5,1.,2.):
+        for m in (.5,1.,2.):
+            vals=[]
+            for q in (3,4):
+                r=runs.get(f'q{q}_h{h:g}_hm{m:g}')
+                vals.append(('>' if r['status']=='right_censored' else '')+f'{r["final"]["t"]/3600:.6f}' if r else '待完成')
+            lines.append(f'| {h:g} | {m:g} | {vals[0]} | {vals[1]} |')
+    for name,r in runs.items():
+        if name not in EXPECTED: continue
+        e=r.get('endpoint'); s=r['stats']
+        checks += [s.get('min_C',1)>0,s.get('max_mass_balance_residual',1)<1e-10]
+        if e: checks += [e['left_max_C']>=.15,e['right_max_C']<.15,e['right_s']-e['left_s']<=.020001]
+    # 合并完整性、正性、有效浓度残差与严格阈值事件区间的验收条件
+    complete=not missing and all(checks)
+    report={'complete':complete,'cases_present':len(set(EXPECTED)&set(runs)),
+            'missing':missing,'checks_passed':all(checks),'reference_comparison':metrics}
+    lines+=['','## 验收范围','',f'预期 22 个全程算例，已完成 {report["cases_present"]} 个。数值验收：'+('通过。' if complete else '尚未完成或存在未通过项。'),
+        '独立参考程序不调用主程序的求解、通量、BDF 系数、误差控制或事件定位代码；共享题给输入插值、配置及 NumPy/SciPy 线性代数库。',
+        '残差检查针对有效浓度的离散方程，不证明实际干物质/水质量闭合。参数扫描是情景分析，不是统计置信区间。',
+        '本记录只裁定数值 P2；论文、结果表、PDF 全页视觉检查与打包验收另记于发布验收记录。',
+        '', '缺少算例：'+(', '.join(missing) if missing else '无'), '',
+        '独立状态比较：', '```json',json.dumps(metrics,ensure_ascii=False,indent=2),'```']
+    # ==================== 检验记录与情景图表输出 ====================
+    (ROOT/'p2/summary.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    (ROOT.parent/('P2_final_record.md' if complete else 'P2_progress.md')).write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    # 仅在所有数值检验通过后生成情景热图和论文对照表
+    if complete:
+        (ROOT.parent/'完整论文-LaTeX/figs').mkdir(parents=True,exist_ok=True)
+        fig,axes=plt.subplots(1,2,figsize=(8.2,3.6),layout='constrained')
+        for ax,q in zip(axes,(3,4)):
+            a=np.array([[runs[f'q{q}_h{h:g}_hm{m:g}']['final']['t']/3600 for m in (.5,1.,2.)] for h in (.5,1.,2.)])
+            im=ax.imshow(a,cmap='Blues',aspect='equal')
+            ax.set(xticks=range(3),xticklabels=['0.5','1','2'],yticks=range(3),yticklabels=['0.5','1','2'],xlabel='Mass transfer multiplier',ylabel='Heat transfer multiplier',title=f'Question {q}: drying time (h)')
+            for i in range(3):
+                for j in range(3): ax.text(j,i,f'{a[i,j]:.3f}',ha='center',va='center',color='white' if a[i,j]>(a.max()+a.min())/2 else 'black',fontsize=11)
+        for ext in ('pdf','png'):
+            fig.savefig(ROOT.parent/f'完整论文-LaTeX/figs/p2_boundary_sensitivity.{ext}',dpi=180)
+        plt.close(fig)
+        rows=[]
+        for q in (3,4):
+            tight=runs[f'q{q}_tight'];ref=runs[f'q{q}_reference']
+            rows.append(f"{q}&{BASE[q]/3600:.4f}&{tight['final']['t']/3600:.4f}&{tight['final']['t']-BASE[q]:+.4f}&{ref['final']['t']-BASE[q]:+.4f}\\\\")
+        tex='\n'.join([r'\begin{table}[H]\centering\small\caption{P2 容差及独立 BDF2 终点对照}\label{tab:p2}',
+          r'\begin{tabular}{rrrrr}\toprule 问题&基准/h&收紧容差/h&收紧差/s&独立差/s\\\midrule']+rows+[r'\bottomrule\end{tabular}\end{table}'])
+        (ROOT.parent/'完整论文-LaTeX/p2_table.tex').write_text(tex,encoding='utf-8')
+    print(json.dumps(report,ensure_ascii=False))
+
+if __name__=='__main__':main()
+\end{Verbatim}
+
+\subsection{环境覆盖与条件性质量假设诊断（\texttt{audit\_assumptions.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+from pathlib import Path
+import argparse,hashlib,json,math
+import numpy as np
+import openpyxl
+
+ROOT=Path(__file__).resolve().parent
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+# 按题给经验关系计算密度；真实湿表观密度解释仅用于条件性相容诊断
+def rho(q,c):return (650+128*c) if q==3 else (760+90*c)
+# ==================== 条件性干物质与水质量诊断 ====================
+def diagnostic(q,data):
+    state=data['final'];c=np.asarray(state['C']);x=np.asarray(state['x'])
+    # 以圆环控制体权重积分含水率相关密度，并采用固定长度的条件性解释
+    edges=np.r_[0.,(x[1:]+x[:-1])/2,1.]
+    weights=np.diff(edges**2)/2
+    radius=state['radius_cm']/100
+    # 由干基含水率关系换算条件性干物质密度，不能冒充实测质量
+    dry=rho(q,c)/(1+c)
+    scale=2*math.pi*.25*radius**2
+    # 比较初始均匀状态与保存终点的条件性质量，识别假设不相容
+    initial=math.pi*.25*.02**2*rho(q,2.55)/3.55
+    apparent=scale*float(weights@dry)
+    water=scale*float(weights@(dry*c))
+    hours=state['t']/3600
+    return {'endpoint_h':hours,'unobserved_environment_hours':hours-4,
+      'unobserved_environment_fraction':(hours-4)/hours,
+      'conditional_initial_dry_mass_kg':initial,
+      'conditional_final_dry_mass_kg':apparent,
+      'conditional_final_water_mass_kg':water,
+      'conditional_dry_mass_ratio':apparent/initial,
+      'conditional_dry_mass_drift_percent':100*(apparent/initial-1),
+      'conditional_endpoint_bound':{
+        'type':'lower' if q==3 else 'upper',
+        'dry_mass_ratio':(rho(3,.15)/1.15)/(rho(3,2.55)/3.55) if q==3 else
+          (radius/.02)**2*rho(4,0)/(rho(4,2.55)/3.55)},
+      'radius_cm':state['radius_cm'],'mean_dry_basis_C':float(2*weights@c),
+      'volume_ratio_under_fixed_length':(radius/.02)**2}
+# ==================== 环境观测覆盖与情景分析 ====================
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--output',type=Path)
+    args=parser.parse_args()
+    source=ROOT/'model.py'
+    inputs=[ROOT.parent/'附件'/f'附件{i}.xlsx' for i in (1,2)]
+    wb=openpyxl.load_workbook(inputs[0],read_only=True,data_only=True)
+    rows=list(wb.active.values);wb.close()
+    air=np.asarray(rows[1:],dtype=float)
+    assert air.shape==(241,3) and air[-1,0]==14400
+    # 末小时均值只概括已观测阶段；不推断观测范围外的环境稳定性
+    last=air[-1,1:];last_hour=air[air[:,0]>=10800,1:].mean(axis=0)
+    cases={};run_hashes={}
+    # 从既有终点读取条件性诊断所需状态，核对其源码及输入指纹
+    for q in (3,4):
+        p=ROOT/f'p2/runs/q{q}_h1_hm1.json'
+        d=json.loads(p.read_text(encoding='utf-8'))
+        assert d['signature']['source_sha256']['model.py']==sha(source)
+        for file in inputs:assert d['signature']['input_sha256'][file.name]==sha(file)
+        cases[str(q)]=diagnostic(q,d);run_hashes[p.name]=sha(p)
+    # 汇总3×3有限情景的时长范围，区分换热与传质单独扰动
+    scans={}
+    for q in (3,4):
+        matrix=[]
+        for h in (.5,1.,2.):
+            row=[]
+            for m in (.5,1.,2.):
+                p=ROOT/f'p2/runs/q{q}_h{h:g}_hm{m:g}.json'
+                d=json.loads(p.read_text(encoding='utf-8'))
+                assert d['status']=='endpoint_reached'
+                assert d['signature']['source_sha256']['model.py']==sha(source)
+                for file in inputs:assert d['signature']['input_sha256'][file.name]==sha(file)
+                row.append(d['final']['t']/3600);run_hashes[p.name]=sha(p)
+            matrix.append(row)
+        a=np.asarray(matrix)
+        scans[str(q)]={'hours':matrix,'min_h':float(a.min()),'max_h':float(a.max()),
+          'heat_only_range_h':float(np.ptp(a[:,1])), 'mass_only_range_h':float(np.ptp(a[1,:])),
+          'interpretation':'deterministic scenarios; no probability model or confidence coverage'}
+    # ==================== 假设审查结果输出 ====================
+    out={'status':'diagnostics_completed_not_physical_validation',
+      'assumptions':['rho(C) conditionally treated as wet bulk density','fixed length 0.25 m',
+        'nodal annular quadrature','no new time integration or result overwrite'],
+      'environment':{'last_observed_s':14400,'last_values':last.tolist(),
+        'last_hour_61_point_mean':last_hour.tolist(),
+        'alternative_extension_computed':False},
+      'cases':cases,'scans':scans,
+      'q3_minus_q4_h':cases['3']['endpoint_h']-cases['4']['endpoint_h'],
+      'attribution':'Both material laws and geometry differ; difference is not a pure shrinkage effect.',
+      'source_sha256':sha(Path(__file__)), 'model_sha256':sha(source),
+      'input_sha256':{p.name:sha(p) for p in inputs},'evidence_sha256':run_hashes}
+    # 只写出诊断报告，不重算干燥轨迹或覆盖原结果
+    if args.output:
+        args.output.parent.mkdir(parents=True,exist_ok=True)
+        args.output.write_text(json.dumps(out,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+    print(json.dumps(out,ensure_ascii=False,indent=2))
+if __name__=='__main__':main()
+\end{Verbatim}
+
+\subsection{数值合同与模型退化测试（\texttt{tests.py}）}
+\begin{Verbatim}[fontsize=\scriptsize,breaklines=true,breakanywhere=true]
+import unittest
+import importlib.util
+import numpy as np
+
+# ==================== 物理退化、解析解与数值合同检验 ====================
+class TestFlux(unittest.TestCase):
+    # 核对界面扩散积分与高精度基准的一致性
+    def test_integrated_diffusivity(self):
+        self.assertIsNotNone(importlib.util.find_spec('model'), 'integral-flux solver is not implemented yet')
+        from model import integral_diffusivity
+        actual=integral_diffusivity(3,np.array([.05]),np.array([.15]),np.array([50.165]),order=16)
+        self.assertAlmostEqual(float(actual[0])/2.580097788700743e-10,1.,places=10)
+
+    # 验证相邻含水率相等时界面积分退化为局部扩散系数
+    def test_equal_concentrations(self):
+        self.assertIsNotNone(importlib.util.find_spec('model'), 'integral-flux solver is not implemented yet')
+        from model import integral_diffusivity, properties
+        c=np.array([.05,.15,1.,2.55]);t=np.array([28.,35.,50.,50.165])
+        ref=properties(3,c,t)[2]
+        np.testing.assert_allclose(integral_diffusivity(3,c,c,t),ref,rtol=1e-13)
+
+    # 检验无通量边界的离散有效量平衡及均匀平衡态保持
+    def test_no_flux_conservation_and_equilibrium(self):
+        from model import Solver,Config
+        s=Solver(Config(n=40));u=1+s.x**2
+        new=s.linear_step(u,np.full(40,1e-8),np.ones(41),0.,0.,.02,30.)
+        self.assertLess(abs(float(s.volume@(new-u))),1e-13)
+        same=s.linear_step(np.full(41,.7),np.full(40,1e-8),np.ones(41),8e-7,.7,.02,30.)
+        np.testing.assert_allclose(same,.7,rtol=1e-13)
+
+    # 以圆柱Bessel解析衰减解检查径向离散与隐式时间推进
+    def test_cylindrical_bessel_decay(self):
+        from scipy.special import j0,j1
+        from model import Solver,Config
+        s=Solver(Config(n=80));D=1e-7;R=.02;z=1.
+        h=D*z*j1(z)/(R*j0(z));u=j0(z*s.x)
+        for _ in range(1000):u=s.linear_step(u,np.full(80,D),np.ones(81),h,0.,R,.1)
+        exact=j0(z*s.x)*np.exp(-D*z*z*100/R**2)
+        self.assertLess(float(np.max(abs(u-exact))),1e-5)
+
+    # 检验交换相邻节点后的扩散系数对称性及正性
+    def test_integral_flux_symmetry_and_positivity(self):
+        from model import integral_diffusivity
+        a=np.array([.05,.15,1.]);b=np.array([.2,2.55,.06]);t=np.array([28.,50.,40.])
+        f=integral_diffusivity(3,a,b,t,16)
+        np.testing.assert_allclose(f,integral_diffusivity(3,b,a,t,16),rtol=1e-13)
+        self.assertTrue(np.all(f>0))
+
+    # 检验线性剖面阈值交点与未达标截面积比例
+    def test_wet_fraction_crossing(self):
+        from model import Solver,Config
+        s=Solver(Config(n=20));c=.2-.1*s.x
+        snap=s.snapshot(0,np.full(21,28.),c)
+        self.assertAlmostEqual(snap['wet_fraction'],.25,places=12)
+
+    # 检验多段未达标区域以及阈值相等状态的面积计数
+    def test_wet_fraction_multiple_regions_and_threshold_equality(self):
+        from model import Solver,Config
+        s=Solver(Config(n=4,grid_power=1))
+        snap=s.snapshot(0,np.full(5,28.),np.array([.2,.1,.2,.1,.2]))
+        # Wet intervals: [0,1/8], [3/8,5/8], [7/8,1].
+        self.assertAlmostEqual(snap['wet_fraction'],.5,places=12)
+        equal=s.snapshot(0,np.full(5,28.),np.full(5,.15))
+        self.assertEqual(equal['wet_fraction'],1.)
+
+    # 检验收缩半径不变时退化为固定半径模型
+    def test_zero_shrinkage_reduces_to_fixed_radius(self):
+        from model import Solver,Config
+        class ConstantRadiusInputs:
+            def boundary(self,t,environment='last'): return 50.,.05
+            def radius(self,t,shrink): return .02
+        args=dict(material=4,n=10,max_time=60,stop_dry=False)
+        a=Solver(Config(**args,shrink=False),ConstantRadiusInputs()).run()
+        b=Solver(Config(**args,shrink=True),ConstantRadiusInputs()).run()
+        np.testing.assert_array_equal(a['final']['T'],b['final']['T'])
+        np.testing.assert_array_equal(a['final']['C'],b['final']['C'])
+
+    # 检验移动域采样采用真实半径且域外结果保持为空
+    def test_moving_sample_uses_physical_radius_and_outside_blanks(self):
+        from model import sample
+        snapshot={'radius_cm':1.2,'C':[.6,.4,.2]}
+        actual=sample(snapshot,'C',[0.,.5,1.,1.2,1.3,2.])
+        np.testing.assert_allclose(actual[:4],[.6,13/30,4/15,.2],atol=1e-14)
+        self.assertEqual(actual[4:],[None,None])
+
+    # 检验半径观测范围外的请求被拒绝，不静默外推
+    def test_radius_data_do_not_silently_extrapolate(self):
+        from model import Inputs
+        inputs=Inputs()
+        with self.assertRaisesRegex(ValueError,'extrapolation'):
+            inputs.radius(float(inputs.radii[-1,0])+1,True)
+
+
+    # 检验自适应时间推进准确落在逐秒输出时刻
+    def test_full_output_lands_on_every_second(self):
+        from model import Solver,Config
+        result=Solver(Config(n=10,early_dt=10,keep_short=True,
+                             output_stride=1,max_time=60,stop_dry=False)).run()
+        self.assertEqual([s['t'] for s in result['short']],list(range(61)))
+
+    # 检验名义边界系数情景与主求解器状态逐值一致
+    def test_boundary_study_nominal_preserves_kernel(self):
+        from model import Solver,Config
+        from p2_study import BoundaryStudy
+        for moving in (False,True):
+            cfg=Config(material=4 if moving else 3,shrink=moving,n=160,
+                       max_time=120,stop_dry=False,output_stride=1)
+            a=Solver(cfg).run(); b=BoundaryStudy(cfg).run()
+            for field in ('T','C'):
+                np.testing.assert_array_equal(a['final'][field],b['final'][field])
+            self.assertEqual(a['stats']['steps'],b['stats']['steps'])
+
+    # 检验独立圆环实现的无通量离散平衡与均匀态保持
+    def test_independent_reference_annulus_conservation(self):
+        from model import Config,Inputs
+        from p2_reference import IndependentBDF2
+        s=IndependentBDF2(Config(n=40),Inputs())
+        old=1+s.x**2
+        new=s.solve(old,old,np.full(40,1e-8),np.ones(41),.02,0.,0.,(1/30,-1/30,0))
+        self.assertLess(abs(float(s.dv@(new-old))),1e-13)
+        same=s.solve(np.full(41,.7),np.full(41,.7),np.full(40,1e-8),
+                     np.ones(41),.02,8e-7,.7,(1/30,-1/30,0))
+        np.testing.assert_allclose(same,.7,rtol=1e-13)
+
+    # 以真实附件对照主求解器与独立参考的短程温湿场
+    def test_independent_reference_real_inputs(self):
+        from model import Solver,Config,Inputs
+        from p2_reference import IndependentBDF2
+        for moving in (False,True):
+            cfg=Config(material=4 if moving else 3,shrink=moving,n=160,
+                       max_time=120,stop_dry=False,output_stride=1)
+            a=Solver(cfg).run();b=IndependentBDF2(cfg,Inputs()).run()
+            np.testing.assert_allclose(a['final']['T'],b['final']['T'],rtol=0,atol=1e-6)
+            np.testing.assert_allclose(a['final']['C'],b['final']['C'],rtol=0,atol=1e-9)
+
+    # 检验输出存储选项不改变有效计算轨迹
+    def test_sampling_does_not_change_valid_trajectory(self):
+        from model import Solver,Config
+        args=dict(material=1,n=10,early_dt=.5,max_time=60,stop_dry=False)
+        a=Solver(Config(**args,keep_short=False)).run()
+        b=Solver(Config(**args,keep_short=True)).run()
+        np.testing.assert_array_equal(a['final']['C'],b['final']['C'])
+        self.assertEqual(a['stats']['steps'],b['stats']['steps'])
+
+    # 检验输入字节变化导致缓存来源指纹变化
+    def test_cache_provenance_covers_input_bytes(self):
+        import tempfile
+        from pathlib import Path
+        from run_study import provenance
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'input';p.write_bytes(b'first')
+            a=provenance([p]);p.write_bytes(b'second');b=provenance([p])
+            self.assertNotEqual(a,b)
+
+# ==================== 执行数值验证集合 ====================
+if __name__=='__main__': unittest.main()
+\end{Verbatim}
